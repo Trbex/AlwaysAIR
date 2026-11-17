@@ -1,0 +1,1255 @@
+diff --git a/.github/scripts/build-ipa.sh b/.github/scripts/build-ipa.sh
+index fbc6ebd..c3072ce 100755
+--- a/.github/scripts/build-ipa.sh
++++ b/.github/scripts/build-ipa.sh
+@@ -90,6 +90,37 @@ if not common:
+ print("App and embedded extensions retain common App Groups with ad-hoc signatures.")
+ VERIFY_ENTITLEMENTS
+ 
++# Validate the built product is a real arm64 iPad-capable device build. These
++# are hard failures: a simulator/x86 slice or an iPhone-only family would mean
++# the IPA cannot install on an iPad Air (M3).
++echo "==> Validating device build (arm64, iPad family, deployment target)"
++binary="$app/GestaltX"
++plist="$app/Info.plist"
++
++archs="$(lipo -archs "$binary" 2>/dev/null || echo "")"
++echo "    Architectures: ${archs:-unknown}"
++case " $archs " in
++  *" arm64 "*) : ;;
++  *) echo "Error: app binary is not arm64 (got: ${archs:-none})" >&2; exit 1 ;;
++esac
++
++# UIDeviceFamily 2 == iPad. The app targets "1,2" (iPhone + iPad).
++families="$(/usr/libexec/PlistBuddy -c 'Print :UIDeviceFamily' "$plist" 2>/dev/null | tr -d ' ' | tr '\n' ',')"
++echo "    UIDeviceFamily: ${families:-unset}"
++if ! grep -q '2' <<< "$families"; then
++  echo "Error: Info.plist UIDeviceFamily does not include iPad (2)" >&2
++  exit 1
++fi
++
++min_os="$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$plist" 2>/dev/null || echo "unknown")"
++echo "    MinimumOSVersion: $min_os"
++sdk_name="$(/usr/libexec/PlistBuddy -c 'Print :DTSDKName' "$plist" 2>/dev/null || echo "unknown")"
++echo "    Built against SDK: $sdk_name"
++case "$sdk_name" in
++  *simulator*) echo "Error: packaged a Simulator build; expected a device (iphoneos) build" >&2; exit 1 ;;
++esac
++echo "    Device build validated."
++
+ ipa="$out/GestaltX_$version.ipa"
+ # Keep an existing package until the replacement is complete.
+ (cd "$stage" && zip -qry "$stage/GestaltX_$version.ipa" Payload)
+diff --git a/.github/workflows/ipad-air-m3-build.yml b/.github/workflows/ipad-air-m3-build.yml
+new file mode 100644
+index 0000000..1dd7860
+--- /dev/null
++++ b/.github/workflows/ipad-air-m3-build.yml
+@@ -0,0 +1,74 @@
++name: Build IPA (iPad Air M3, hosted runner)
++
++# Portable, manually-triggered build on a GitHub-hosted macOS runner. The main
++# build.yml targets a self-hosted `xcode-27` label; this workflow lets anyone
++# build an ad-hoc, re-signable IPA from a fork with no custom infrastructure.
++#
++# It reuses the same .github/scripts/build-ipa.sh, which now validates that the
++# packaged app is an arm64, iPad-capable (UIDeviceFamily 2) device build before
++# zipping — so a successful run means a real iPad-installable IPA, not a claim.
++
++on:
++  workflow_dispatch:
++    inputs:
++      ref:
++        description: Branch, tag, or commit to build
++        type: string
++        default: feature/ipad-air-m3
++
++permissions:
++  contents: read
++
++concurrency:
++  group: ipad-air-m3-build-${{ github.ref }}
++  cancel-in-progress: true
++
++jobs:
++  build:
++    runs-on: macos-15
++    timeout-minutes: 45
++    steps:
++      - name: Checkout source
++        uses: actions/checkout@v4
++        with:
++          ref: ${{ inputs.ref }}
++          fetch-depth: 1
++
++      - name: Select latest stable Xcode
++        uses: maxim-lobanov/setup-xcode@v1
++        with:
++          xcode-version: latest-stable
++
++      - name: Show toolchain
++        run: |
++          xcodebuild -version
++          swift --version || true
++
++      - name: Restore native device console
++        id: gxconsole-cache
++        uses: actions/cache@v4
++        with:
++          path: Native/DeviceConsole/build/GXDeviceConsole.xcframework
++          key: gxconsole-${{ runner.os }}-${{ hashFiles('Native/DeviceConsole/build-xcframework.sh', 'Native/DeviceConsole/Cargo.toml', 'Native/DeviceConsole/Cargo.lock', 'Native/DeviceConsole/src/**', 'Native/DeviceConsole/vendor/**') }}
++
++      - name: Build native device console
++        if: steps.gxconsole-cache.outputs.cache-hit != 'true'
++        run: |
++          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
++          command -v nasm >/dev/null || brew install nasm
++          cd Native/DeviceConsole
++          ./build-xcframework.sh
++
++      - name: Build and validate IPA
++        id: build
++        run: |
++          export BUILD_DATE="$(date -u +%F)"
++          .github/scripts/build-ipa.sh "$RUNNER_TEMP/ipa"
++
++      - name: Upload IPA artifact
++        uses: actions/upload-artifact@v4
++        with:
++          name: GestaltX-iPadAirM3-${{ steps.build.outputs.version }}
++          path: ${{ steps.build.outputs.ipa }}
++          if-no-files-found: error
++          retention-days: 14
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index cecb61d..e30d9f8 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,33 @@
+ 
+ English | [简体中文](CHANGELOG_ZH-CN.md)
+ 
++## [Unreleased] - iPad Air M3 Edition
++
++### Added
++
++- **iPad Air M3 — Advanced Settings**: a device-aware screen curating Display,
++  iPad Features, and Apple Intelligence options with honest, hardware-derived
++  compatibility badges (Supported / Native / Experimental / Not supported by
++  hardware / Not applicable). Reuses the existing staging, apply, backup, and
++  per-key restore paths — no new write mechanism.
++- Read-only physical device detection (`hw.machine`) mapping iPad Air (M3)
++  identifiers `iPad15,3`–`iPad15,6` to verified display/silicon profiles.
++- **Always-On Clock**: an app-level keep-awake clock (dimmed, drifting, burn-in
++  aware) offered as a clearly-labeled alternative where native AOD is not
++  possible. Writes nothing to the device.
++- **Restore Original Region** in the Apple Intelligence section, reverting region
++  keys through the standard verified-write path.
++- Native **iPad sidebar navigation** (`NavigationSplitView`) on regular width;
++  iPhone keeps the tab bar.
++- Portable GitHub Actions workflow on a hosted `macos-15` runner, plus arm64 /
++  iPad-family / device-build validation in the IPA build script.
++
++### Notes
++
++- iPad Air (M3) uses a fixed-60 Hz LED-backlit IPS LCD with no LTPO/OLED, so a
++  native system Always-On Display is not possible; AOD flags are labeled "Not
++  supported by hardware". No hardware spoofing or security bypass is added.
++
+ ## [1.1.1] - 2026-11-14
+ 
+ Build `11140102`.
+diff --git a/GestaltX/AlwaysOnClockView.swift b/GestaltX/AlwaysOnClockView.swift
+new file mode 100644
+index 0000000..867d44b
+--- /dev/null
++++ b/GestaltX/AlwaysOnClockView.swift
+@@ -0,0 +1,184 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// Copyright (C) 2026 huamidev
++//
++// App-level Always-On Clock.
++//
++// This is NOT a native system Always-On Display. iPad Air (M3) has a fixed-60 Hz
++// LCD with no low-refresh hardware, so iOS cannot render a true system AOD. This
++// view is a software alternative: while GestaltX is foremost and this screen is
++// open, it keeps the display awake (disables the idle timer) and shows a dimmed,
++// slowly drifting clock to reduce static burn-in risk.
++//
++// It changes nothing on the device, writes no MobileGestalt keys, and stops the
++// moment the view closes or the app is backgrounded.
++import SwiftUI
++#if canImport(UIKit)
++import UIKit
++#endif
++
++struct AlwaysOnClockView: View {
++    @Environment(\.dismiss) private var dismiss
++    @Environment(\.scenePhase) private var scenePhase
++
++    /// Dim the system brightness while the clock is shown, restoring it on exit.
++    @AppStorage("GestaltX.aodClock.dim.v1") private var dimsDisplay = true
++    @AppStorage("GestaltX.aodClock.seconds.v1") private var showsSeconds = false
++    @AppStorage("GestaltX.aodClock.dimLevel.v1") private var dimLevel = 0.25
++
++    @State private var previousBrightness: CGFloat?
++    @State private var showsControls = true
++
++    private var timeFormat: Date.FormatStyle {
++        showsSeconds
++            ? .dateTime.hour().minute().second()
++            : .dateTime.hour().minute()
++    }
++
++    var body: some View {
++        GeometryReader { proxy in
++            TimelineView(.periodic(from: .now, by: showsSeconds ? 1 : 10)) { context in
++                let now = context.date
++                ZStack {
++                    Color.black.ignoresSafeArea()
++
++                    clock(now: now)
++                        // Drift the clock on a slow cycle to avoid a static image.
++                        .offset(burnInOffset(for: now, in: proxy.size))
++                        .animation(.easeInOut(duration: 2), value: burnInStep(for: now))
++
++                    if showsControls { controlsOverlay }
++                }
++            }
++        }
++        .statusBarHidden(true)
++        .persistentSystemOverlays(.hidden)
++        .contentShape(Rectangle())
++        .onTapGesture {
++            withAnimation { showsControls.toggle() }
++        }
++        .onAppear { startKeepAwake() }
++        .onDisappear { stopKeepAwake() }
++        .onChange(of: scenePhase) { _, phase in
++            // The idle timer and brightness only make sense while active. iOS also
++            // resets isIdleTimerDisabled on backgrounding; re-assert on return.
++            switch phase {
++            case .active: startKeepAwake()
++            case .background, .inactive: stopKeepAwake()
++            @unknown default: break
++            }
++        }
++    }
++
++    // MARK: - Clock
++
++    private func clock(now: Date) -> some View {
++        VStack(spacing: 10) {
++            Text(now, format: timeFormat)
++                .font(.system(size: 92, weight: .thin, design: .rounded))
++                .monospacedDigit()
++                .minimumScaleFactor(0.4)
++                .lineLimit(1)
++            Text(now, format: .dateTime.weekday(.wide).month().day())
++                .font(.system(size: 22, weight: .regular, design: .rounded))
++                .foregroundStyle(.secondary)
++        }
++        .foregroundStyle(.white.opacity(0.82))
++        .padding(.horizontal, 24)
++    }
++
++    private var controlsOverlay: some View {
++        VStack {
++            HStack {
++                Button {
++                    stopKeepAwake()
++                    dismiss()
++                } label: {
++                    Label(L("Close"), systemImage: "xmark.circle.fill")
++                        .labelStyle(.iconOnly)
++                        .font(.title2)
++                        .foregroundStyle(.white.opacity(0.6))
++                }
++                .accessibilityLabel(L("Close"))
++                Spacer()
++            }
++            .padding(20)
++
++            Spacer()
++
++            VStack(spacing: 14) {
++                Toggle(L("Show Seconds"), isOn: $showsSeconds)
++                Toggle(L("Dim Display"), isOn: $dimsDisplay)
++                    .onChange(of: dimsDisplay) { _, dim in applyBrightness(dim: dim) }
++                if dimsDisplay {
++                    HStack {
++                        Image(systemName: "sun.min").foregroundStyle(.secondary)
++                        Slider(value: $dimLevel, in: 0.05...0.6)
++                            .onChange(of: dimLevel) { _, _ in applyBrightness(dim: true) }
++                        Image(systemName: "sun.max").foregroundStyle(.secondary)
++                    }
++                }
++                Text(L("Not a native Always-On Display. Keeps the screen awake only while this view is open and GestaltX is in the foreground."))
++                    .font(.caption2)
++                    .foregroundStyle(.secondary)
++                    .multilineTextAlignment(.center)
++            }
++            .tint(.white)
++            .foregroundStyle(.white.opacity(0.75))
++            .padding(18)
++            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
++            .frame(maxWidth: 420)
++            .padding(.horizontal, 24)
++            .padding(.bottom, 28)
++        }
++        .transition(.opacity)
++    }
++
++    // MARK: - Burn-in mitigation
++
++    /// A step index that advances every ~60 seconds, used to drive the drift.
++    private func burnInStep(for date: Date) -> Int {
++        Int(date.timeIntervalSinceReferenceDate / 60)
++    }
++
++    /// A small, slowly changing offset so the clock never sits at one pixel set.
++    /// All math is done in Double and handed to the Double CGSize initializer to
++    /// avoid Double/CGFloat mixing.
++    private func burnInOffset(for date: Date, in size: CGSize) -> CGSize {
++        let step = Double(burnInStep(for: date) % 4)
++        let angle = step / 4 * 2 * Double.pi
++        let radiusX = Double(min(size.width, 420)) * 0.08
++        let radiusY = Double(size.height) * 0.06
++        return CGSize(width: cos(angle) * radiusX, height: sin(angle) * radiusY)
++    }
++
++    // MARK: - Keep-awake / brightness
++
++    private func startKeepAwake() {
++        #if canImport(UIKit)
++        UIApplication.shared.isIdleTimerDisabled = true
++        #endif
++        applyBrightness(dim: dimsDisplay)
++    }
++
++    private func stopKeepAwake() {
++        #if canImport(UIKit)
++        UIApplication.shared.isIdleTimerDisabled = false
++        if let previousBrightness {
++            UIScreen.main.brightness = previousBrightness
++        }
++        previousBrightness = nil
++        #endif
++    }
++
++    private func applyBrightness(dim: Bool) {
++        #if canImport(UIKit)
++        if dim {
++            if previousBrightness == nil { previousBrightness = UIScreen.main.brightness }
++            UIScreen.main.brightness = CGFloat(dimLevel)
++        } else if let previousBrightness {
++            UIScreen.main.brightness = previousBrightness
++            self.previousBrightness = nil
++        }
++        #endif
++    }
++}
+diff --git a/GestaltX/ContentView.swift b/GestaltX/ContentView.swift
+index 71f2926..ea25428 100644
+--- a/GestaltX/ContentView.swift
++++ b/GestaltX/ContentView.swift
+@@ -14,6 +14,7 @@ struct ContentView: View {
+     @StateObject private var launchCatalog = LaunchArtworkCatalogModel()
+     @ObservedObject private var starPrompt = StarPromptController.shared
+     @Environment(\.scenePhase) private var scenePhase
++    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+     @State private var importOffer: PlistImportOffer?
+     @State private var showsImportConfirmation = false
+     @State private var wallpaperOffer: SharedWallpaperOffer?
+@@ -38,15 +39,11 @@ struct ContentView: View {
+     @AppStorage("GestaltX.acceptedWelcome.v1") private var acceptedWelcome = false
+ 
+     var body: some View {
+-        TabView(selection: $selectedTab) {
+-            NavigationStack { tools }
+-                .tabItem { Label(L("Tools"), systemImage: "square.grid.2x2") }.tag(0)
+-            NavigationStack { FieldsView() }
+-                .tabItem { Label(L("MG Control"), systemImage: "slider.horizontal.3") }.tag(1)
+-            NavigationStack { BackupsView(share: presentShare) }
+-                .tabItem { Label(L("Backups"), systemImage: "clock.arrow.circlepath") }.tag(2)
+-            NavigationStack { AboutView() }
+-                .tabItem { Label(L("About"), systemImage: "info.circle") }.tag(3)
++        rootNavigation
++        .onChange(of: horizontalSizeClass) { _, newValue in
++            // The sidebar has an extra destination (tag 4) that the compact
++            // TabView does not; fall back to Tools when collapsing to tabs.
++            if newValue != .regular && selectedTab > 3 { selectedTab = 0 }
+         }
+         .environmentObject(model)
+         .tint(.blue)
+@@ -222,6 +219,63 @@ struct ContentView: View {
+         }
+     }
+ 
++    // MARK: - Adaptive root navigation
++    // iPad (regular width) uses a native sidebar split view; iPhone (compact)
++    // keeps the original tab bar. Both carry every sheet/alert modifier applied
++    // in `body`, so the share-import and change-review plumbing is unchanged.
++
++    @ViewBuilder private var rootNavigation: some View {
++        if horizontalSizeClass == .regular {
++            sidebarNavigation
++        } else {
++            tabNavigation
++        }
++    }
++
++    private var tabNavigation: some View {
++        TabView(selection: $selectedTab) {
++            NavigationStack { tools }
++                .tabItem { Label(L("Tools"), systemImage: "square.grid.2x2") }.tag(0)
++            NavigationStack { FieldsView() }
++                .tabItem { Label(L("MG Control"), systemImage: "slider.horizontal.3") }.tag(1)
++            NavigationStack { BackupsView(share: presentShare) }
++                .tabItem { Label(L("Backups"), systemImage: "clock.arrow.circlepath") }.tag(2)
++            NavigationStack { AboutView() }
++                .tabItem { Label(L("About"), systemImage: "info.circle") }.tag(3)
++        }
++    }
++
++    private var sidebarNavigation: some View {
++        NavigationSplitView {
++            List(selection: sidebarSelection) {
++                Label(L("Tools"), systemImage: "square.grid.2x2").tag(0)
++                Label(L("iPad Air M3"), systemImage: "ipad").tag(4)
++                Label(L("MG Control"), systemImage: "slider.horizontal.3").tag(1)
++                Label(L("Backups"), systemImage: "clock.arrow.circlepath").tag(2)
++                Label(L("About"), systemImage: "info.circle").tag(3)
++            }
++            .navigationTitle("GestaltX")
++        } detail: {
++            NavigationStack { detailView }
++        }
++        .navigationSplitViewStyle(.balanced)
++    }
++
++    /// Bridges the sidebar's optional single-selection to the shared `selectedTab`.
++    private var sidebarSelection: Binding<Int?> {
++        Binding(get: { selectedTab }, set: { if let value = $0 { selectedTab = value } })
++    }
++
++    @ViewBuilder private var detailView: some View {
++        switch selectedTab {
++        case 1: FieldsView()
++        case 2: BackupsView(share: presentShare)
++        case 3: AboutView()
++        case 4: IPadAirM3View()
++        default: tools
++        }
++    }
++
+     private var isPreviewSession: Bool {
+         #if targetEnvironment(simulator)
+         let arguments = ProcessInfo.processInfo.arguments
+@@ -371,6 +425,12 @@ struct ContentView: View {
+                     .disabled(!model.hasDocument || model.isBusy)
+                 }
+             }
++            Section(L("Device-Specific")) {
++                NavigationLink { IPadAirM3View() } label: {
++                    Label(L("iPad Air M3 — Advanced Settings"), systemImage: "ipad")
++                }
++                .disabled(model.isBusy)
++            }
+             Section(L("Customization")) {
+                 NavigationLink { SystemSettingsView(model: systemSettings) } label: {
+                     Label(L("System Settings"), systemImage: "gearshape")
+diff --git a/GestaltX/DeviceModel.swift b/GestaltX/DeviceModel.swift
+new file mode 100644
+index 0000000..ede93ca
+--- /dev/null
++++ b/GestaltX/DeviceModel.swift
+@@ -0,0 +1,182 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// Copyright (C) 2026 huamidev
++//
++// Physical device classification for GestaltX.
++//
++// This reads the kernel-reported hardware identifier (`hw.machine`, e.g.
++// "iPad15,3") through the existing GXCopyPhysicalHardwareIdentity() bridge and
++// classifies the device the app is actually running on. It is used only to
++// present accurate, device-specific compatibility information in the UI.
++//
++// It never writes, spoofs, or alters hardware identity. An identifier that is
++// not in the known table is reported as `.unknown` rather than guessed, so the
++// UI degrades to conservative, honest defaults instead of inventing facts.
++import Foundation
++#if canImport(UIKit)
++import UIKit
++#endif
++
++/// A classified physical device.
++struct DeviceModel: Equatable {
++    /// Device families GestaltX treats specially. Everything else is `.otherIPad`,
++    /// `.otherIPhone`, or `.unknown`.
++    enum Family: String, Equatable {
++        case iPadAirM3_11
++        case iPadAirM3_13
++        case iPadAirM2
++        case otherIPad
++        case otherIPhone
++        case unknown
++    }
++
++    /// Raw `hw.machine` value, e.g. "iPad15,3". Empty only if detection failed.
++    let identifier: String
++    let family: Family
++    /// Human-readable marketing name for display. Never used for any write.
++    let marketingName: String
++    /// Static facts about the panel and silicon, used to classify capabilities.
++    let display: DisplayProfile
++
++    var isIPadAirM3: Bool { family == .iPadAirM3_11 || family == .iPadAirM3_13 }
++
++    var isIPad: Bool {
++        switch family {
++        case .iPadAirM3_11, .iPadAirM3_13, .iPadAirM2, .otherIPad: return true
++        case .otherIPhone, .unknown: return false
++        }
++    }
++
++    // MARK: - Panel / silicon facts
++
++    /// Verifiable hardware facts that decide whether a capability flag can have a
++    /// real effect. Defaults are deliberately conservative for unknown devices.
++    struct DisplayProfile: Equatable {
++        /// Panel technology, as published by Apple (e.g. "Liquid Retina (LED-backlit IPS LCD)").
++        let panel: String
++        /// Whether the panel is OLED. LCD panels cannot do a true low-power AOD.
++        let isOLED: Bool
++        /// Whether the panel has a variable/low refresh rate (ProMotion/LTPO) needed
++        /// for a native 1 Hz Always-On Display. LCD + fixed 60 Hz means `false`.
++        let hasLowRefreshRate: Bool
++        /// Whether the hardware natively supports a system Always-On Display.
++        var supportsNativeAlwaysOn: Bool { isOLED && hasLowRefreshRate }
++        /// Whether the chip/device is natively marketed as supporting Apple Intelligence.
++        let appleIntelligenceNative: Bool
++        /// Whether the device has a Dynamic Island. iPads do not.
++        let hasDynamicIsland: Bool
++
++        static let unknown = DisplayProfile(
++            panel: "Unknown",
++            isOLED: false,
++            hasLowRefreshRate: false,
++            appleIntelligenceNative: false,
++            hasDynamicIsland: false
++        )
++    }
++
++    // MARK: - Detection
++
++    /// The device this process is running on.
++    static let current: DeviceModel = classify(identifier: machineIdentifier())
++
++    /// Resolve the physical hardware identifier. Prefers the sysctl-backed bridge
++    /// used elsewhere in the app; falls back to `uname` and, in the Simulator, to
++    /// the SIMULATOR_MODEL_IDENTIFIER environment variable.
++    static func machineIdentifier() -> String {
++        #if targetEnvironment(simulator)
++        if let simulated = ProcessInfo.processInfo.environment["SIMULATOR_MODEL_IDENTIFIER"],
++           !simulated.isEmpty {
++            return simulated
++        }
++        #endif
++        let physical = GXCopyPhysicalHardwareIdentity()
++        if let machine = physical["hw.machine"], !machine.isEmpty {
++            return machine
++        }
++        var info = utsname()
++        uname(&info)
++        let mirror = Mirror(reflecting: info.machine)
++        let identifier = mirror.children.reduce(into: "") { partialResult, element in
++            guard let value = element.value as? Int8, value != 0 else { return }
++            partialResult.append(Character(UnicodeScalar(UInt8(value))))
++        }
++        return identifier
++    }
++
++    /// Map a raw identifier to a classified device. Unknown identifiers are
++    /// classified by prefix only (iPad vs iPhone) and never assigned panel facts
++    /// they were not verified to have.
++    static func classify(identifier raw: String) -> DeviceModel {
++        let identifier = raw.trimmingCharacters(in: .whitespacesAndNewlines)
++        if let known = knownModels[identifier] {
++            return DeviceModel(identifier: identifier, family: known.family,
++                               marketingName: known.name, display: known.display)
++        }
++        // Unknown identifier: classify coarsely, assume nothing about the panel.
++        if identifier.hasPrefix("iPad") {
++            return DeviceModel(identifier: identifier, family: .otherIPad,
++                               marketingName: unknownIPadName(for: identifier),
++                               display: .unknown)
++        }
++        if identifier.hasPrefix("iPhone") {
++            return DeviceModel(identifier: identifier, family: .otherIPhone,
++                               marketingName: "iPhone", display: .unknown)
++        }
++        return DeviceModel(identifier: identifier.isEmpty ? "Unknown" : identifier,
++                           family: .unknown,
++                           marketingName: identifier.isEmpty ? "This device" : identifier,
++                           display: .unknown)
++    }
++
++    private static func unknownIPadName(for identifier: String) -> String {
++        #if canImport(UIKit)
++        return UIDevice.current.model // "iPad"
++        #else
++        return "iPad"
++        #endif
++    }
++
++    // MARK: - Known device table
++    //
++    // iPad Air (M3) identifiers and panel facts are cross-checked against Apple's
++    // published 2025 iPad Air tech specs and The Apple Wiki. The M3 Air uses a
++    // fixed-60 Hz LED-backlit IPS "Liquid Retina" LCD (no OLED, no ProMotion), so
++    // it has no native Always-On Display hardware, and the M3 is marketed as
++    // "Built for Apple Intelligence".
++
++    private struct KnownModel {
++        let family: Family
++        let name: String
++        let display: DisplayProfile
++    }
++
++    private static let iPadAirM3Display = DisplayProfile(
++        panel: "Liquid Retina (LED-backlit IPS LCD), 60 Hz",
++        isOLED: false,
++        hasLowRefreshRate: false,
++        appleIntelligenceNative: true,
++        hasDynamicIsland: false
++    )
++
++    private static let iPadAirM2Display = DisplayProfile(
++        panel: "Liquid Retina (LED-backlit IPS LCD), 60 Hz",
++        isOLED: false,
++        hasLowRefreshRate: false,
++        appleIntelligenceNative: true,
++        hasDynamicIsland: false
++    )
++
++    private static let knownModels: [String: KnownModel] = [
++        // iPad Air 11-inch (M3, 2025)
++        "iPad15,3": KnownModel(family: .iPadAirM3_11, name: "iPad Air 11-inch (M3)", display: iPadAirM3Display),
++        "iPad15,4": KnownModel(family: .iPadAirM3_11, name: "iPad Air 11-inch (M3)", display: iPadAirM3Display),
++        // iPad Air 13-inch (M3, 2025)
++        "iPad15,5": KnownModel(family: .iPadAirM3_13, name: "iPad Air 13-inch (M3)", display: iPadAirM3Display),
++        "iPad15,6": KnownModel(family: .iPadAirM3_13, name: "iPad Air 13-inch (M3)", display: iPadAirM3Display),
++        // iPad Air (M2, 2024) — recognized so the view can note the M3-specific scope.
++        "iPad14,8": KnownModel(family: .iPadAirM2, name: "iPad Air 11-inch (M2)", display: iPadAirM2Display),
++        "iPad14,9": KnownModel(family: .iPadAirM2, name: "iPad Air 11-inch (M2)", display: iPadAirM2Display),
++        "iPad14,10": KnownModel(family: .iPadAirM2, name: "iPad Air 13-inch (M2)", display: iPadAirM2Display),
++        "iPad14,11": KnownModel(family: .iPadAirM2, name: "iPad Air 13-inch (M2)", display: iPadAirM2Display)
++    ]
++}
+diff --git a/GestaltX/IPadAirCompatibility.swift b/GestaltX/IPadAirCompatibility.swift
+new file mode 100644
+index 0000000..8800960
+--- /dev/null
++++ b/GestaltX/IPadAirCompatibility.swift
+@@ -0,0 +1,153 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// Copyright (C) 2026 huamidev
++//
++// Honest, device-aware compatibility classification for the iPad Air M3 view.
++//
++// For a given physical device, this says whether a MobileGestalt capability can
++// have a real effect — distinguishing a flag the hardware already satisfies, a
++// flag whose effect is build-dependent, and a flag the hardware cannot honor at
++// all (for example a true Always-On Display on an LCD panel).
++//
++// This file is intentionally free of SwiftUI. It returns a status plus plain
++// strings; the view decides how to present them. Classification is derived from
++// verifiable panel/silicon facts in `DeviceModel.DisplayProfile`, never from an
++// assumption that writing a flag changes the hardware.
++import Foundation
++
++enum CompatibilityStatus: Equatable {
++    /// The capability works on this hardware.
++    case supported
++    /// The hardware already provides this natively; the flag is usually unnecessary.
++    case native
++    /// The flag can be written, but the effect depends on the OS build, panel, or Apple services.
++    case experimental
++    /// The hardware cannot honor this; writing the flag will not produce the real feature.
++    case unsupportedHardware
++    /// The capability does not apply to this device class.
++    case notApplicable
++
++    /// Short badge label (localization key).
++    var label: String {
++        switch self {
++        case .supported: "Supported"
++        case .native: "Native"
++        case .experimental: "Experimental"
++        case .unsupportedHardware: "Not supported by hardware"
++        case .notApplicable: "Not applicable"
++        }
++    }
++
++    /// SF Symbol for the badge.
++    var symbol: String {
++        switch self {
++        case .supported: "checkmark.seal"
++        case .native: "checkmark.seal.fill"
++        case .experimental: "exclamationmark.triangle"
++        case .unsupportedHardware: "xmark.octagon"
++        case .notApplicable: "minus.circle"
++        }
++    }
++
++    /// Severity drives the badge color in the view (0 good … 3 blocked).
++    enum Severity { case good, info, warn, blocked, neutral }
++    var severity: Severity {
++        switch self {
++        case .supported: .good
++        case .native: .info
++        case .experimental: .warn
++        case .unsupportedHardware: .blocked
++        case .notApplicable: .neutral
++        }
++    }
++}
++
++struct CapabilityCompatibility {
++    let status: CompatibilityStatus
++    /// One-line, device-specific explanation (localization key or literal).
++    let note: String
++}
++
++enum IPadAirCompatibility {
++    /// Classify a capability (by its `Capability.id`) for a device.
++    static func status(for capabilityID: String, on device: DeviceModel) -> CapabilityCompatibility {
++        let panel = device.display
++
++        switch capabilityID {
++
++        // MARK: Display — Always-On family (rides on native AOD hardware)
++        case "aod":
++            return panel.supportsNativeAlwaysOn
++                ? .init(status: .experimental,
++                        note: "The panel may support a low-power Always-On mode. Effect depends on the OS build.")
++                : .init(status: .unsupportedHardware,
++                        note: "This device uses an LCD without a low-refresh panel, so a true system Always-On Display cannot render. The flag may add a Settings entry but will not produce a working AOD. See the in-app Always-On Clock for an app-level alternative.")
++        case "aodVibrancy", "aodHighLuminance", "aodFlipbook", "aodFlipbookCount":
++            return panel.supportsNativeAlwaysOn
++                ? .init(status: .experimental, note: "Always-On rendering option. Effect depends on the OS build.")
++                : .init(status: .unsupportedHardware,
++                        note: "Depends on native Always-On Display hardware, which this LCD device does not have.")
++
++        // MARK: Display — software/rendering flags (hardware-agnostic)
++        case "liquidGlass":
++            return .init(status: .supported,
++                         note: "Low-power Liquid Glass rendering is a software capability and applies on iPadOS 26+.")
++        case "parallax":
++            return .init(status: .supported, note: "Disables motion-based wallpaper parallax. Software-only.")
++
++        // MARK: Display — advertise-only flags that still need matching hardware
++        case "hdrPhotoDisplay":
++            return .init(status: .experimental,
++                         note: "Advertises HDR photo rendering. This Liquid Retina LCD has a limited HDR range, so results differ from an HDR/OLED panel.")
++        case "pwm":
++            return .init(status: .unsupportedHardware,
++                         note: "PWM dimming is an OLED-panel behavior. This device uses an LCD, so the flag has no backing hardware.")
++        case "displayPort":
++            return .init(status: .experimental,
++                         note: "Advertises DisplayPort output. The USB-C port supports external display, but behavior depends on the adapter and OS.")
++
++        // MARK: iPad features
++        case "stageManager":
++            return .init(status: .native,
++                         note: "Stage Manager is natively supported on M-series iPad Air. The flag is normally unnecessary on this device.")
++        case "pencil":
++            return .init(status: .native,
++                         note: "Apple Pencil Pro and Apple Pencil (USB-C) are natively supported on iPad Air (M3).")
++        case "ipadApps":
++            return .init(status: .notApplicable,
++                         note: "This preset enables iPad app compatibility types on iPhone. It does not apply to an iPad.")
++
++        // MARK: Apple Intelligence
++        case "ai":
++            return panel.appleIntelligenceNative
++                ? .init(status: .native,
++                        note: "iPad Air (M3) is built for Apple Intelligence; the hardware already advertises the generative-models capability. Region availability is the usual lever — see Region Code.")
++                : .init(status: .experimental,
++                        note: "Sets the generative-models capability. Availability still depends on region and Apple services.")
++        case "siriAIMode":
++            return .init(status: .experimental,
++                         note: "Sets SiriMode to 2 without hardware spoofing. Resource downloads and availability are not guaranteed.")
++        case "siriOnDevice":
++            return .init(status: .experimental,
++                         note: "Changes the device-specific on-device Siri capability. Keep the current value unless you intend to experiment; restore the original to recover.")
++        case "audioIntelligence", "personalTranslator", "photosCleanUp",
++             "handwritingSynthesis", "alwaysListeningSiri":
++            return .init(status: .experimental,
++                         note: "iOS 27 capability flag. Effect depends on the OS build, region, and Apple services.")
++
++        default:
++            return .init(status: .experimental,
++                         note: "Effect depends on the device and OS build.")
++        }
++    }
++
++    /// The native Always-On Display conclusion for this device, used by the view's
++    /// dedicated AOD panel. Returns a headline status and explanation.
++    static func nativeAlwaysOn(on device: DeviceModel) -> CapabilityCompatibility {
++        if device.display.supportsNativeAlwaysOn {
++            return .init(status: .experimental,
++                         note: "This device's panel may support a low-power Always-On Display. Any capability flag remains experimental and build-dependent.")
++        }
++        return .init(status: .unsupportedHardware,
++                     note: "iPad Air (M3) uses a fixed-60 Hz LED-backlit IPS LCD with no low-refresh (LTPO) hardware. A native system Always-On Display is not possible on this panel. Toggling AOD capability flags will not enable a functional system AOD.")
++    }
++}
+diff --git a/GestaltX/IPadAirM3View.swift b/GestaltX/IPadAirM3View.swift
+new file mode 100644
+index 0000000..5dd8d7d
+--- /dev/null
++++ b/GestaltX/IPadAirM3View.swift
+@@ -0,0 +1,250 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// Copyright (C) 2026 huamidev
++//
++// "iPad Air M3 — Advanced Settings": a device-aware, curated front end over the
++// existing capability engine. It reuses GestaltManager's staging, apply, backup,
++// and per-key restore paths — it introduces no new write mechanism — and labels
++// every option with an honest, hardware-derived compatibility status.
++//
++// Nothing here spoofs hardware identity. Always-On Display is presented with its
++// real conclusion for this LCD panel (not supported in hardware), alongside the
++// app-level Always-On Clock alternative.
++import SwiftUI
++
++struct IPadAirM3View: View {
++    @EnvironmentObject private var model: GestaltManager
++    private let device = DeviceModel.current
++    @State private var asksRegionRestore = false
++
++    /// Reverts the region keys to their recorded originals through the standard
++    /// restore path (backup + verified write), used by "Restore Original Region".
++    private static let regionRestore = Capability(
++        id: "regionRestore", category: .intelligence, title: "Region", detail: "",
++        keys: [GestaltKeys.regionCode, GestaltKeys.regionInfo, GestaltKeys.legacyRegionInfo]
++    )
++
++    private let displayIDs = ["aod", "aodVibrancy", "aodHighLuminance", "aodFlipbook",
++                              "aodFlipbookCount", "hdrPhotoDisplay", "liquidGlass",
++                              "parallax", "pwm", "displayPort"]
++    private let ipadIDs = ["stageManager", "pencil", "ipadApps"]
++    private let intelligenceIDs = ["ai", "siriAIMode", "siriOnDevice", "audioIntelligence",
++                                   "personalTranslator", "photosCleanUp",
++                                   "handwritingSynthesis", "alwaysListeningSiri"]
++
++    var body: some View {
++        Form {
++            deviceHeader
++            if !device.isIPadAirM3 { scopeNotice }
++
++            alwaysOnDisplaySection
++
++            if model.hasDocument {
++                capabilitySection(L("Display"), symbol: "display", ids: displayIDs)
++                iPadFeaturesSection
++                intelligenceSection
++                if model.changeCount > 0 {
++                    Section { NavigationLink(L("Review Changes")) { ChangeReviewView(isSheet: false) } }
++                }
++            } else {
++                Section {
++                    ContentUnavailableView(
++                        L("No Document Open"),
++                        systemImage: "doc.text.magnifyingglass",
++                        description: Text(L("Read MobileGestalt in Tools to edit capability flags. The Always-On Clock works without reading the device."))
++                    )
++                }
++            }
++        }
++        .navigationTitle(L("iPad Air M3"))
++        .disabled(model.isBusy)
++        .alert(L("Restore Original Region"), isPresented: $asksRegionRestore) {
++            Button(L("Cancel"), role: .cancel) {}
++            Button(L("Restore"), role: .destructive) {
++                Task {
++                    await model.restoreCapability(Self.regionRestore)
++                    model.regionCodeID = "keep"
++                    model.regionID = "keep"
++                }
++            }
++        } message: {
++            Text(L("Restore the recorded original region code and info. A backup is created before writing. Restart the device afterward."))
++        }
++    }
++
++    // MARK: - Device header
++
++    private var deviceHeader: some View {
++        Section {
++            LabeledContent(L("Model"), value: device.marketingName)
++            LabeledContent(L("Identifier"), value: device.identifier)
++            LabeledContent(L("Display"), value: device.display.panel)
++            LabeledContent(L("Apple Intelligence"),
++                           value: L(device.display.appleIntelligenceNative ? "Native" : "Unknown"))
++            LabeledContent("iPadOS", value: "\(UIDevice.current.systemVersion) (\(VersionSupport.label))")
++        } header: {
++            Text(L("Detected Device"))
++        } footer: {
++            Text(L("Detection reads the kernel hardware identifier only. GestaltX never changes CPU, board, or physical hardware identity."))
++        }
++    }
++
++    private var scopeNotice: some View {
++        Section {
++            Label(L("These settings are tuned for iPad Air (M3). Options still apply on this device, but the compatibility notes are written for the M3 Air panel and chip."),
++                  systemImage: "info.circle")
++                .font(.footnote).foregroundStyle(.secondary)
++        }
++    }
++
++    // MARK: - Always-On Display (honest conclusion + app-level alternative)
++
++    private var alwaysOnDisplaySection: some View {
++        let verdict = IPadAirCompatibility.nativeAlwaysOn(on: device)
++        return Section {
++            HStack(alignment: .firstTextBaseline) {
++                Text(L("Native Always-On Display"))
++                Spacer(minLength: 8)
++                CompatBadge(status: verdict.status)
++            }
++            Text(L(verdict.note)).font(.caption).foregroundStyle(.secondary)
++            NavigationLink {
++                AlwaysOnClockView()
++            } label: {
++                Label(L("Open Always-On Clock (app-level)"), systemImage: "clock")
++            }
++        } header: {
++            Text(L("Always-On"))
++        } footer: {
++            Text(L("The Always-On Clock keeps the screen awake with a dimmed, drifting clock while GestaltX is open. It is a software feature, not a system Always-On Display, and makes no changes to the device."))
++        }
++    }
++
++    // MARK: - Generic capability section
++
++    private func capabilitySection(_ title: String, symbol: String, ids: [String]) -> some View {
++        Section {
++            ForEach(capabilities(ids)) { capability in
++                CapabilityPresetRow(capability: capability, device: device)
++            }
++        } header: {
++            Label(L(title), systemImage: symbol)
++        }
++    }
++
++    private var iPadFeaturesSection: some View {
++        Section {
++            ForEach(capabilities(ipadIDs)) { capability in
++                CapabilityPresetRow(capability: capability, device: device)
++            }
++        } header: {
++            Label(L("iPad Features"), systemImage: "ipad.landscape")
++        } footer: {
++            Text(L("Stage Manager and Apple Pencil are natively supported on iPad Air (M3); these flags are usually unnecessary. External-display behavior is advertised through the DisplayPort flag in the Display section."))
++        }
++    }
++
++    // MARK: - Apple Intelligence
++
++    private var intelligenceSection: some View {
++        Section {
++            Picker(L("Region Code"), selection: $model.regionCodeID) {
++                ForEach(RegionPreset.all) { Text(L($0.title)).tag($0.id) }
++            }
++            if model.regionCodeID != "keep" {
++                Text(L("A device restart may be required.")).font(.caption).foregroundStyle(.secondary)
++            }
++            Button(L("Restore Original Region")) { asksRegionRestore = true }
++                .disabled(!model.canRestore(Self.regionRestore) && model.regionCodeID == "keep")
++
++            ForEach(capabilities(intelligenceIDs)) { capability in
++                CapabilityPresetRow(capability: capability, device: device)
++            }
++        } header: {
++            Label(L("Apple Intelligence"), systemImage: "sparkles")
++        } footer: {
++            Text(L("iPad Air (M3) is built for Apple Intelligence. Changing the region code is usually the only lever needed where availability is restricted; capability flags are experimental and do not guarantee model downloads."))
++        }
++    }
++
++    // MARK: - Helpers
++
++    private func capabilities(_ ids: [String]) -> [Capability] {
++        ids.compactMap { id in Capability.all.first { $0.id == id } }
++    }
++}
++
++// MARK: - Capability row with compatibility badge
++
++/// A single capability preset row, mirroring the picker/revert behavior used in
++/// CategoryView, plus a device-specific compatibility badge and note.
++struct CapabilityPresetRow: View {
++    let capability: Capability
++    let device: DeviceModel
++    @EnvironmentObject private var model: GestaltManager
++
++    private var compat: CapabilityCompatibility {
++        IPadAirCompatibility.status(for: capability.id, on: device)
++    }
++
++    var body: some View {
++        VStack(alignment: .leading, spacing: 6) {
++            HStack(alignment: .firstTextBaseline, spacing: 6) {
++                Text(L(capability.title))
++                Spacer(minLength: 8)
++                CompatBadge(status: compat.status)
++            }
++            Picker(selection: Binding(
++                get: { model.choices[capability.id] ?? .keep },
++                set: { model.choices[capability.id] = $0 }
++            )) {
++                ForEach(capability.availableChoices) { choice in
++                    let title = capability.id == "siriOnDevice" && choice == .disable
++                        ? "Restore Original" : choice.title
++                    Text(L(title)).tag(choice)
++                }
++            } label: {
++                Text(L("Action"))
++            }
++            .pickerStyle(.menu)
++
++            Text(L(compat.note)).font(.caption).foregroundStyle(.secondary)
++
++            HStack(alignment: .firstTextBaseline) {
++                if (model.choices[capability.id] ?? .keep) != .keep {
++                    Text(L(capability.effectHint)).font(.caption2).foregroundStyle(.tertiary)
++                }
++                Spacer(minLength: 8)
++                Button(L("Revert")) { Task { await model.restoreCapability(capability) } }
++                    .font(.caption).buttonStyle(.borderless)
++                    .disabled(!model.canRestore(capability))
++            }
++        }
++        .padding(.vertical, 2)
++    }
++}
++
++// MARK: - Badge
++
++struct CompatBadge: View {
++    let status: CompatibilityStatus
++
++    var body: some View {
++        Label(L(status.label), systemImage: status.symbol)
++            .font(.caption2.weight(.semibold))
++            .labelStyle(.titleAndIcon)
++            .padding(.horizontal, 8)
++            .padding(.vertical, 3)
++            .background(tint.opacity(0.15), in: Capsule())
++            .foregroundStyle(tint)
++    }
++
++    private var tint: Color {
++        switch status.severity {
++        case .good: .green
++        case .info: .blue
++        case .warn: .orange
++        case .blocked: .red
++        case .neutral: .gray
++        }
++    }
++}
+diff --git a/docs/IPAD_AIR_M3.md b/docs/IPAD_AIR_M3.md
+new file mode 100644
+index 0000000..19339af
+--- /dev/null
++++ b/docs/IPAD_AIR_M3.md
+@@ -0,0 +1,186 @@
++# GestaltX — iPad Air M3 Edition
++
++Device-targeted additions for the **iPad Air 11-inch (M3, 2025)** running
++**iPadOS 27.x**, built on top of the existing GestaltX capability engine.
++
++This document describes what was added, what works on this hardware, what is
++experimental, and what the hardware cannot do regardless of any flag. It does
++not claim any capability the device does not physically support, and it does not
++claim a build or on-device test that was not actually run (see
++[Testing](#testing-report)).
++
++---
++
++## 1. Target device — verified facts
++
++| Property | iPad Air 11-inch (M3) |
++| --- | --- |
++| Model identifiers | `iPad15,3` (Wi-Fi), `iPad15,4` (Cellular) |
++| 13-inch siblings | `iPad15,5` (Wi-Fi), `iPad15,6` (Cellular) |
++| SoC | Apple M3, 16-core Neural Engine |
++| Display | Liquid Retina — **LED-backlit IPS LCD**, 2360×1640, **60 Hz fixed** |
++| OLED / ProMotion / LTPO | **No** |
++| Apple Intelligence | **Native** ("Built for Apple Intelligence") |
++| Architecture | ARM64 |
++
++These facts drive every compatibility label in the app. They are cross-checked
++against Apple's published 2025 iPad Air tech specs and The Apple Wiki.
++
++The most important consequence: **the M3 Air has no low-refresh (LTPO) OLED
++panel, so a native system Always-On Display is not physically possible on this
++device.** Toggling AOD capability flags does not change that.
++
++---
++
++## 2. What was added
++
++All new code lives in the auto-synchronized `GestaltX/` group, so it compiles
++into the existing app target with no project-file surgery.
++
++### New files
++| File | Purpose |
++| --- | --- |
++| `GestaltX/DeviceModel.swift` | Classifies the physical device from `hw.machine` (read-only). Maps `iPad15,3`–`iPad15,6` to a family and a verified display/silicon profile. Unknown identifiers degrade to conservative defaults — never guessed. |
++| `GestaltX/IPadAirCompatibility.swift` | Turns device facts into an honest per-capability status: Supported / Native / Experimental / Not supported by hardware / Not applicable, each with a one-line reason. |
++| `GestaltX/IPadAirM3View.swift` | The **iPad Air M3 — Advanced Settings** screen. Curates Display, iPad Features, and Apple Intelligence options with compatibility badges. Reuses the existing staging / apply / backup / per-key restore paths — it adds no new write mechanism. |
++| `GestaltX/AlwaysOnClockView.swift` | An **app-level** Always-On Clock (keep-awake + dimmed, drifting clock). Explicitly **not** a system AOD; changes nothing on the device. |
++
++### Changed files
++| File | Change |
++| --- | --- |
++| `GestaltX/ContentView.swift` | Adaptive root navigation: a native **`NavigationSplitView` sidebar on iPad** (regular width) and the original `TabView` on iPhone (compact). Added the iPad Air M3 entry to Tools and as a sidebar item. All existing sheet/alert/share-import plumbing is unchanged. |
++| `.github/scripts/build-ipa.sh` | Added hard validation after signing: arm64 slice present, `UIDeviceFamily` includes iPad (2), and the package is a device (not Simulator) build. |
++| `.github/workflows/ipad-air-m3-build.yml` | New portable workflow on GitHub-hosted `macos-15` (the existing `build.yml` needs a private `xcode-27` runner). |
++
++---
++
++## 3. Implemented features (iPad Air M3 — Advanced Settings)
++
++### Display
++| Option | Status on M3 Air | Notes |
++| --- | --- | --- |
++| Always-On Display (capability) | **Not supported by hardware** | LCD, no LTPO. Flag may add a Settings entry; no functional system AOD. |
++| AOD Vibrancy / High-Luminance / Flipbook / Flipbook Count | **Not supported by hardware** | All depend on native AOD hardware the panel lacks. |
++| HDR Photo Display | **Experimental** | LCD has a limited HDR range vs an HDR/OLED panel. |
++| Liquid Glass low-power rendering | **Supported** | Software capability, iPadOS 26+. |
++| Disable Wallpaper Parallax | **Supported** | Software-only. |
++| PWM | **Not supported by hardware** | PWM dimming is an OLED behavior. |
++| DisplayPort output | **Experimental** | USB-C supports external display; behavior depends on adapter/OS. |
++
++### iPad Features
++| Option | Status | Notes |
++| --- | --- | --- |
++| Stage Manager | **Native** | Already supported on M-series iPad Air; flag normally unnecessary. |
++| Apple Pencil | **Native** | Apple Pencil Pro / USB-C natively supported. |
++| iPad App Compatibility | **Not applicable** | That preset targets iPhone; shown for transparency. |
++| External display | **Experimental** | Advertised via the DisplayPort flag (Display section). |
++
++### Apple Intelligence
++| Option | Status | Notes |
++| --- | --- | --- |
++| Region Code (+ **Restore Original Region**) | **Supported** | The real lever where AI availability is region-restricted. Restore reverts region keys via the standard backup+verified-write path. |
++| Apple Intelligence Capability | **Native** | M3 already advertises the generative-models capability. |
++| Siri AI Mode | **Experimental** | Sets `SiriMode` to 2 without hardware spoofing. No download guarantee. |
++| On-Device Siri | **Experimental** | Device-specific capability; restore original to recover. |
++| Audio Intelligence / Personal Translator / Photos Clean Up / Handwriting Synthesis / Always-Listening Hey Siri | **Experimental** | iOS 27 flags; depend on OS build, region, Apple services. |
++
++### Always-On Clock (app-level)
++- Keeps the display awake only **while the view is open and GestaltX is in the
++  foreground** (`isIdleTimerDisabled`).
++- Dimmed, slowly drifting clock to reduce static burn-in; optional brightness
++  floor; restores brightness and the idle timer on exit/background.
++- Writes no MobileGestalt keys and makes no device changes.
++
++---
++
++## 4. Always-On Display — the honest conclusion
++
++The iPad Air M3 uses a **fixed-60 Hz LED-backlit IPS LCD**. A native iOS
++Always-On Display requires an OLED panel capable of a very low (≈1 Hz) refresh
++rate (LTPO), which this device does not have. Therefore:
++
++- **Native system AOD cannot be enabled** on this hardware by any MobileGestalt
++  flag. The app shows this as **"Not supported by hardware."**
++- The capability flag may still toggle a Settings entry, but the panel cannot
++  render a true low-power AOD, so it will not function as one.
++- The **Always-On Clock** is offered as a clearly-labeled app-level alternative.
++  It is a screensaver-style keep-awake, not a system feature.
++
++---
++
++## 5. Safety & recovery (unchanged guarantees, reused)
++
++The iPad Air M3 view uses the same safety flow as the rest of GestaltX:
++
++- An automatic backup before each device write; the write is read back and
++  verified.
++- Before/after review of every staged change (Review Changes).
++- Per-option **Revert** restores recorded original values and types.
++- **Restore Original Region** reverts region keys through the verified path.
++- **No hardware spoofing**: CPU, board, and product identity are never changed
++  by this view. Device detection is read-only (`hw.machine`).
++- Face ID / Touch ID, Apple services, and unrelated settings are untouched.
++
++---
++
++## 6. Build & install
++
++### Build the IPA (GitHub Actions, hosted runner)
++1. Push this branch to your fork.
++2. Actions → **Build IPA (iPad Air M3, hosted runner)** → **Run workflow**.
++3. Download the `GestaltX-iPadAirM3-<version>` artifact (an ad-hoc, unsigned-for-
++   distribution IPA with the App Group entitlements embedded for re-signing).
++
++The build **fails** rather than producing an invalid artifact if the app is not
++an arm64, iPad-capable device build.
++
++### Install with SideStore
++1. Install SideStore and complete its pairing/anisette setup on the iPad.
++2. AirDrop or copy the `.ipa` to the iPad (Files).
++3. SideStore → **+** → select the IPA → let it re-sign with your account.
++4. SideStore re-signs using the embedded App Group entitlement; keep the share
++   extension when prompted.
++5. Trust the developer profile if iPadOS asks, then launch GestaltX.
++6. In GestaltX: **Tools → Read MobileGestalt** (requires iPadOS 27.x), then open
++   **iPad Air M3 — Advanced Settings** (Tools, or the iPad sidebar).
++
++AltStore and Sideloadly follow the same re-signing model.
++
++> Signing needs a certificate/profile with at least one usable **App Group**.
++> The IPA carries the app's and the share extension's entitlements so the
++> re-signing tool can register a common group.
++
++---
++
++## 7. Testing report
++
++**Build environment used for this change:** Linux (no macOS/Xcode). Therefore:
++
++- ❌ **Not done here:** `xcodebuild` compilation, Simulator run, device install,
++  on-device MobileGestalt read/write, Face ID/region round-trips. None of these
++  were performed, and none are claimed as passing.
++- ✅ **Done here (static):**
++  - New Swift files written against the project's existing APIs and idioms
++    (`GestaltManager` staging/restore, `Capability`, `L()`, `RegionPreset`,
++    `GestaltKeys`).
++  - Verified the Xcode project uses a file-system-synchronized group, so new
++    `GestaltX/*.swift` files are included in the target automatically.
++  - `bash -n` syntax check on the modified `build-ipa.sh`.
++  - YAML validation of both workflows.
++  - Device facts (identifiers, panel, AI support) verified against public specs.
++
++**How to get real pass/fail:** run the hosted-runner workflow (section 6). A
++green run is the actual compile gate and produces the validated IPA. On-device
++behavior must then be confirmed on a physical iPad Air M3; capability effects
++depend on the exact iPadOS 27.x build.
++
++---
++
++## 8. Known limitations
++
++- Native AOD and PWM are hardware-blocked on this LCD and are labeled as such.
++- Experimental Apple Intelligence flags do not guarantee model downloads or
++  feature availability; region and Apple services still govern that.
++- Compatibility labels are tuned for the M3 Air; on other devices the view shows
++  a scope notice and the options still function.
++- This edition does not add hardware spoofing or any security bypass, by design.
