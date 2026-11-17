@@ -1,0 +1,74 @@
+name: Build IPA (iPad Air M3, hosted runner)
+
+# Portable, manually-triggered build on a GitHub-hosted macOS runner. The main
+# build.yml targets a self-hosted `xcode-27` label; this workflow lets anyone
+# build an ad-hoc, re-signable IPA from a fork with no custom infrastructure.
+#
+# It reuses the same .github/scripts/build-ipa.sh, which now validates that the
+# packaged app is an arm64, iPad-capable (UIDeviceFamily 2) device build before
+# zipping — so a successful run means a real iPad-installable IPA, not a claim.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or commit to build
+        type: string
+        default: feature/ipad-air-m3
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ipad-air-m3-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+
+      - name: Select latest stable Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version || true
+
+      - name: Restore native device console
+        id: gxconsole-cache
+        uses: actions/cache@v4
+        with:
+          path: Native/DeviceConsole/build/GXDeviceConsole.xcframework
+          key: gxconsole-${{ runner.os }}-${{ hashFiles('Native/DeviceConsole/build-xcframework.sh', 'Native/DeviceConsole/Cargo.toml', 'Native/DeviceConsole/Cargo.lock', 'Native/DeviceConsole/src/**', 'Native/DeviceConsole/vendor/**') }}
+
+      - name: Build native device console
+        if: steps.gxconsole-cache.outputs.cache-hit != 'true'
+        run: |
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+          command -v nasm >/dev/null || brew install nasm
+          cd Native/DeviceConsole
+          ./build-xcframework.sh
+
+      - name: Build and validate IPA
+        id: build
+        run: |
+          export BUILD_DATE="$(date -u +%F)"
+          .github/scripts/build-ipa.sh "$RUNNER_TEMP/ipa"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GestaltX-iPadAirM3-${{ steps.build.outputs.version }}
+          path: ${{ steps.build.outputs.ipa }}
+          if-no-files-found: error
+          retention-days: 14
