@@ -2,6 +2,33 @@
 
 English | [简体中文](CHANGELOG_ZH-CN.md)
 
+## [Unreleased] - iPad Air M3 Edition
+
+### Added
+
+- **iPad Air M3 — Advanced Settings**: a device-aware screen curating Display,
+  iPad Features, and Apple Intelligence options with honest, hardware-derived
+  compatibility badges (Supported / Native / Experimental / Not supported by
+  hardware / Not applicable). Reuses the existing staging, apply, backup, and
+  per-key restore paths — no new write mechanism.
+- Read-only physical device detection (`hw.machine`) mapping iPad Air (M3)
+  identifiers `iPad15,3`–`iPad15,6` to verified display/silicon profiles.
+- **Always-On Clock**: an app-level keep-awake clock (dimmed, drifting, burn-in
+  aware) offered as a clearly-labeled alternative where native AOD is not
+  possible. Writes nothing to the device.
+- **Restore Original Region** in the Apple Intelligence section, reverting region
+  keys through the standard verified-write path.
+- Native **iPad sidebar navigation** (`NavigationSplitView`) on regular width;
+  iPhone keeps the tab bar.
+- Portable GitHub Actions workflow on a hosted `macos-15` runner, plus arm64 /
+  iPad-family / device-build validation in the IPA build script.
+
+### Notes
+
+- iPad Air (M3) uses a fixed-60 Hz LED-backlit IPS LCD with no LTPO/OLED, so a
+  native system Always-On Display is not possible; AOD flags are labeled "Not
+  supported by hardware". No hardware spoofing or security bypass is added.
+
 ## [1.1.1] - 2026-11-14
 
 Build `11140102`.

@@ -14,6 +14,7 @@ struct ContentView: View {
     @StateObject private var launchCatalog = LaunchArtworkCatalogModel()
     @ObservedObject private var starPrompt = StarPromptController.shared
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var importOffer: PlistImportOffer?
     @State private var showsImportConfirmation = false
     @State private var wallpaperOffer: SharedWallpaperOffer?
@@ -38,15 +39,11 @@ struct ContentView: View {
     @AppStorage("GestaltX.acceptedWelcome.v1") private var acceptedWelcome = false
 
     var body: some View {
-        TabView(selection: $selectedTab) {
-            NavigationStack { tools }
-                .tabItem { Label(L("Tools"), systemImage: "square.grid.2x2") }.tag(0)
-            NavigationStack { FieldsView() }
-                .tabItem { Label(L("MG Control"), systemImage: "slider.horizontal.3") }.tag(1)
-            NavigationStack { BackupsView(share: presentShare) }
-                .tabItem { Label(L("Backups"), systemImage: "clock.arrow.circlepath") }.tag(2)
-            NavigationStack { AboutView() }
-                .tabItem { Label(L("About"), systemImage: "info.circle") }.tag(3)
+        rootNavigation
+        .onChange(of: horizontalSizeClass) { _, newValue in
+            // The sidebar has an extra destination (tag 4) that the compact
+            // TabView does not; fall back to Tools when collapsing to tabs.
+            if newValue != .regular && selectedTab > 3 { selectedTab = 0 }
         }
         .environmentObject(model)
         .tint(.blue)
@@ -222,6 +219,63 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - Adaptive root navigation
+    // iPad (regular width) uses a native sidebar split view; iPhone (compact)
+    // keeps the original tab bar. Both carry every sheet/alert modifier applied
+    // in `body`, so the share-import and change-review plumbing is unchanged.
+
+    @ViewBuilder private var rootNavigation: some View {
+        if horizontalSizeClass == .regular {
+            sidebarNavigation
+        } else {
+            tabNavigation
+        }
+    }
+
+    private var tabNavigation: some View {
+        TabView(selection: $selectedTab) {
+            NavigationStack { tools }
+                .tabItem { Label(L("Tools"), systemImage: "square.grid.2x2") }.tag(0)
+            NavigationStack { FieldsView() }
+                .tabItem { Label(L("MG Control"), systemImage: "slider.horizontal.3") }.tag(1)
+            NavigationStack { BackupsView(share: presentShare) }
+                .tabItem { Label(L("Backups"), systemImage: "clock.arrow.circlepath") }.tag(2)
+            NavigationStack { AboutView() }
+                .tabItem { Label(L("About"), systemImage: "info.circle") }.tag(3)
+        }
+    }
+
+    private var sidebarNavigation: some View {
+        NavigationSplitView {
+            List(selection: sidebarSelection) {
+                Label(L("Tools"), systemImage: "square.grid.2x2").tag(0)
+                Label(L("iPad Air M3"), systemImage: "ipad").tag(4)
+                Label(L("MG Control"), systemImage: "slider.horizontal.3").tag(1)
+                Label(L("Backups"), systemImage: "clock.arrow.circlepath").tag(2)
+                Label(L("About"), systemImage: "info.circle").tag(3)
+            }
+            .navigationTitle("GestaltX")
+        } detail: {
+            NavigationStack { detailView }
+        }
+        .navigationSplitViewStyle(.balanced)
+    }
+
+    /// Bridges the sidebar's optional single-selection to the shared `selectedTab`.
+    private var sidebarSelection: Binding<Int?> {
+        Binding(get: { selectedTab }, set: { if let value = $0 { selectedTab = value } })
+    }
+
+    @ViewBuilder private var detailView: some View {
+        switch selectedTab {
+        case 1: FieldsView()
+        case 2: BackupsView(share: presentShare)
+        case 3: AboutView()
+        case 4: IPadAirM3View()
+        default: tools
+        }
+    }
+
     private var isPreviewSession: Bool {
         #if targetEnvironment(simulator)
         let arguments = ProcessInfo.processInfo.arguments
@@ -370,6 +424,12 @@ struct ContentView: View {
                     }
                     .disabled(!model.hasDocument || model.isBusy)
                 }
+            }
+            Section(L("Device-Specific")) {
+                NavigationLink { IPadAirM3View() } label: {
+                    Label(L("iPad Air M3 — Advanced Settings"), systemImage: "ipad")
+                }
+                .disabled(model.isBusy)
             }
             Section(L("Customization")) {
                 NavigationLink { SystemSettingsView(model: systemSettings) } label: {

@@ -90,6 +90,37 @@ if not common:
 print("App and embedded extensions retain common App Groups with ad-hoc signatures.")
 VERIFY_ENTITLEMENTS
 
+# Validate the built product is a real arm64 iPad-capable device build. These
+# are hard failures: a simulator/x86 slice or an iPhone-only family would mean
+# the IPA cannot install on an iPad Air (M3).
+echo "==> Validating device build (arm64, iPad family, deployment target)"
+binary="$app/GestaltX"
+plist="$app/Info.plist"
+
+archs="$(lipo -archs "$binary" 2>/dev/null || echo "")"
+echo "    Architectures: ${archs:-unknown}"
+case " $archs " in
+  *" arm64 "*) : ;;
+  *) echo "Error: app binary is not arm64 (got: ${archs:-none})" >&2; exit 1 ;;
+esac
+
+# UIDeviceFamily 2 == iPad. The app targets "1,2" (iPhone + iPad).
+families="$(/usr/libexec/PlistBuddy -c 'Print :UIDeviceFamily' "$plist" 2>/dev/null | tr -d ' ' | tr '\n' ',')"
+echo "    UIDeviceFamily: ${families:-unset}"
+if ! grep -q '2' <<< "$families"; then
+  echo "Error: Info.plist UIDeviceFamily does not include iPad (2)" >&2
+  exit 1
+fi
+
+min_os="$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$plist" 2>/dev/null || echo "unknown")"
+echo "    MinimumOSVersion: $min_os"
+sdk_name="$(/usr/libexec/PlistBuddy -c 'Print :DTSDKName' "$plist" 2>/dev/null || echo "unknown")"
+echo "    Built against SDK: $sdk_name"
+case "$sdk_name" in
+  *simulator*) echo "Error: packaged a Simulator build; expected a device (iphoneos) build" >&2; exit 1 ;;
+esac
+echo "    Device build validated."
+
 ipa="$out/GestaltX_$version.ipa"
 # Keep an existing package until the replacement is complete.
 (cd "$stage" && zip -qry "$stage/GestaltX_$version.ipa" Payload)
